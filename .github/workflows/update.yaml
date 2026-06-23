@@ -107,24 +107,50 @@ jobs:
           fi
           # Full when: mode=full, OR incremental fell back to full. Full rebuild
           # is driven purely by the DB file being absent (populate-from-scratch).
+          FULL=false
           if [ "${{ steps.mode.outputs.mode }}" = "full" ] || [ "${{ steps.prev.outputs.fallback_full }}" = "true" ]; then
-            echo "==> FULL rebuild"
-            rm -f cve.db
-          else
-            echo "==> INCREMENTAL update (lastMod window from metadata)"
+            FULL=true
           fi
           CURATED="$GITHUB_WORKSPACE/scanner/extra/curated_dispositions.json"
           CURATED_ARGS=()
-          [ -f "$CURATED" ] && CURATED_ARGS=(--curated "$CURATED")
+          if [ -f "$CURATED" ]; then CURATED_ARGS=(--curated "$CURATED"); fi
           # OSV/Red Hat backports are always refreshed in full (cheap vs NVD).
-          python3 scanner/extra/database.py \
-            -d cve.db \
-            --backports \
-            --ecosystems "$BACKPORT_ECOSYSTEMS" \
-            --redhat \
-            --redhat-packages "$REDHAT_PACKAGES" \
-            --redhat-releases "$REDHAT_RELEASES" \
-            "${CURATED_ARGS[@]}"
+          run_update() {
+            python3 scanner/extra/database.py \
+              -d cve.db \
+              --backports \
+              --ecosystems "$BACKPORT_ECOSYSTEMS" \
+              --redhat \
+              --redhat-packages "$REDHAT_PACKAGES" \
+              --redhat-releases "$REDHAT_RELEASES" \
+              "${CURATED_ARGS[@]}"
+          }
+          # NVD's API (behind Cloudflare) intermittently returns 503/timeouts and
+          # database.py exits on the first non-200 with no retry. Retry the whole
+          # update with exponential backoff so a transient outage doesn't fail the
+          # scheduled job. Each full attempt starts from a clean DB; incremental
+          # attempts reuse the reassembled base.
+          attempts=5
+          delay=30
+          for i in $(seq 1 "$attempts"); do
+            if [ "$FULL" = true ]; then
+              echo "==> FULL rebuild (attempt $i/$attempts)"
+              rm -f cve.db
+            else
+              echo "==> INCREMENTAL update (attempt $i/$attempts)"
+            fi
+            if run_update; then
+              echo "NVD update succeeded on attempt $i"
+              exit 0
+            fi
+            if [ "$i" -lt "$attempts" ]; then
+              echo "::warning::NVD update attempt $i failed; retrying in ${delay}s"
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+          done
+          echo "::error::NVD update failed after $attempts attempts (likely a sustained NVD outage)." >&2
+          exit 1
 
       - name: Sanity-check the database
         run: |
