@@ -1,65 +1,165 @@
-name: Update database and its container
+name: Update CVE database (incremental NVD + backports)
+
+# Refreshes cve.db and re-splits it into the dump.p* parts this repo ships.
+# Downstream (checkfix_tools_monorepo/scripts/build-cve-db.sh) clones this repo
+# and runs build.sh to reassemble cve.db, so the committed dump parts are the
+# product.
+#
+# By default the NVD pull is INCREMENTAL: database.py reads metadata.last_mod
+# from the existing DB and queries NVD only for records changed since then
+# (lastModStartDate..lastModEndDate), so it does not re-download all ~280k CVEs
+# every run. A FULL rebuild runs on the 1st of each month (and on demand) to
+# self-heal drift and stay inside NVD's 120-day lastMod window.
+#
+# Requires repository secret: NVD_API_KEY  (Settings -> Secrets and variables ->
+# Actions). Get a key at https://nvd.nist.gov/developers/request-an-api-key.
+
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Update mode"
+        type: choice
+        default: incremental
+        options: [incremental, full]
   schedule:
+    # 03:00 UTC on the 1st and 15th. The 1st-of-month run is forced to full
+    # (see the 'Decide mode' step); the 15th is incremental.
     - cron: "0 3 1,15 * *"
+
+permissions:
+  contents: write
 
 jobs:
   update-database:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      # secinto fork that carries update-db + backports/redhat/curated tooling.
+      SCANNER_REPO: https://github.com/secinto/CVEScannerV3.git
+      # Keep these in sync with checkfix_tools_monorepo/scripts/build-cve-db.sh.
+      BACKPORT_ECOSYSTEMS: "Debian:13,Debian:12,Debian:11,Ubuntu:24.04:LTS,Ubuntu:22.04:LTS,Ubuntu:20.04:LTS,AlmaLinux:8,AlmaLinux:9,AlmaLinux:10"
+      REDHAT_PACKAGES: "openssh,httpd,openssl,bind,nginx"
+      REDHAT_RELEASES: "7,8,9,10"
     steps:
-      - name: Check out repository
+      - name: Check out database repository
         uses: actions/checkout@v4
-      - name: Pre-setup
-        run: |
-          pip install -r <(curl https://raw.githubusercontent.com/scmanjarrez/CVEScannerV2/master/extra/requirements.txt)
-          echo "MSFV=$(curl -s https://raw.githubusercontent.com/rapid7/metasploit-framework/master/Gemfile.lock | perl -ne '/metasploit-framework\s*\((.*?)\)/ && print $1')-dev" >> $GITHUB_ENV
-          git config --global push.default current
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      - name: Retrieve latest database
-        uses: addnab/docker-run-action@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          image: scmanjarrez/cvescanner:db
-          options: --rm -v ${{ github.workspace }}:/tmp/cve
-          run: cp cve.db /tmp/cve
-      - name: Update DB
+          python-version: "3.12"
+
+      - name: Install sqlite3
         run: |
-          sudo chown runner:runner cve.db && sudo rm semicolon_delimited_script
-          python3 <(curl https://raw.githubusercontent.com/scmanjarrez/CVEScannerV2/master/extra/database.py)
-          rm dump*
-          sqlite3 cve.db .dump > dump.sql
-          split -b 25M -d dump.sql dump.p
-          rm dump.sql
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Clone CVEScannerV3 (build tooling)
+        run: |
+          git clone --depth 1 "$SCANNER_REPO" scanner
+          python3 -m pip install --upgrade pip
+          pip install -r scanner/extra/requirements.txt
+
+      - name: Decide mode (incremental vs full)
+        id: mode
+        run: |
+          # Priority: manual input > 1st-of-month forced full > incremental.
+          MODE="${{ github.event.inputs.mode }}"
+          if [ -z "$MODE" ]; then
+            if [ "$(date -u +%d)" = "01" ]; then MODE=full; else MODE=incremental; fi
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Selected mode: $MODE"
+
+      - name: Reassemble previous DB (incremental only)
+        if: steps.mode.outputs.mode == 'incremental'
+        id: prev
+        run: |
+          # Rebuild cve.db from the committed dump parts so database.py can do a
+          # differential NVD pull against its metadata.last_mod. If the parts are
+          # missing or the result is unusable, fall back to a full rebuild.
+          ok=true
+          ./build.sh || ok=false
+          if [ "$ok" = true ] && [ -f cve.db ]; then
+            CVES=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;" 2>/dev/null || echo 0)
+            LAST=$(sqlite3 cve.db "SELECT last_mod FROM metadata;" 2>/dev/null || echo "")
+          else
+            CVES=0; LAST=""
+          fi
+          if [ "${CVES:-0}" -lt 100000 ] || [ -z "$LAST" ]; then
+            echo "Prior DB unusable for incremental (cves=$CVES, last_mod='$LAST') — forcing full."
+            rm -f cve.db
+            echo "fallback_full=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Incremental base ready: $CVES CVEs, last_mod=$LAST"
+            echo "fallback_full=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run NVD update + backports
         env:
-          NVD_KEY: ${{secrets.API_KEY}}
-      - name: Upload updated DB
+          # database.py reads the NVD key from the NVD_KEY env var.
+          NVD_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          if [ -z "$NVD_KEY" ]; then
+            echo "::error::NVD_API_KEY secret is not set." >&2
+            exit 1
+          fi
+          # Full when: mode=full, OR incremental fell back to full. Full rebuild
+          # is driven purely by the DB file being absent (populate-from-scratch).
+          if [ "${{ steps.mode.outputs.mode }}" = "full" ] || [ "${{ steps.prev.outputs.fallback_full }}" = "true" ]; then
+            echo "==> FULL rebuild"
+            rm -f cve.db
+          else
+            echo "==> INCREMENTAL update (lastMod window from metadata)"
+          fi
+          CURATED="$GITHUB_WORKSPACE/scanner/extra/curated_dispositions.json"
+          CURATED_ARGS=()
+          [ -f "$CURATED" ] && CURATED_ARGS=(--curated "$CURATED")
+          # OSV/Red Hat backports are always refreshed in full (cheap vs NVD).
+          python3 scanner/extra/database.py \
+            -d cve.db \
+            --backports \
+            --ecosystems "$BACKPORT_ECOSYSTEMS" \
+            --redhat \
+            --redhat-packages "$REDHAT_PACKAGES" \
+            --redhat-releases "$REDHAT_RELEASES" \
+            "${CURATED_ARGS[@]}"
+
+      - name: Sanity-check the database
+        run: |
+          CVES=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;")
+          BP=$(sqlite3 cve.db "SELECT COUNT(*) FROM backports;")
+          echo "CVEs: $CVES, backports: $BP"
+          # A healthy DB has hundreds of thousands of CVEs; refuse to ship a
+          # truncated/empty DB that would clobber the good dumps in this repo.
+          [ "${CVES:-0}" -ge 100000 ] || { echo "::error::cve.db has only $CVES CVEs — refusing to publish." >&2; exit 1; }
+          [ "${BP:-0}" -ge 1 ]        || { echo "::error::backports table is empty — refusing to publish." >&2; exit 1; }
+
+      - name: Regenerate dump parts
+        run: |
+          rm -f dump.p*
+          sqlite3 cve.db .dump > dump.sql
+          # 25 MiB parts, zero-padded numeric suffix -> dump.p00, dump.p01, ...
+          split -b 25M -d dump.sql dump.p
+          rm -f dump.sql
+
+      - name: Upload cve.db artifact
         uses: actions/upload-artifact@v4
         with:
           name: cve.db
           path: cve.db
           retention-days: 15
-      - name: Update repository
+
+      - name: Commit refreshed dumps
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # cve.db is gitignored; only the dump.p* parts are tracked.
+          # Orphan-commit keeps the repo small despite ~150 MB of binary dumps.
           git checkout --orphan latest
           git add -A
-          git commit -m "Update database (msf $MSFV)"
+          git commit -m "Update CVE database (${{ steps.mode.outputs.mode }} + backports) - $(date -u +%Y-%m-%d)"
           git branch -D master
           git branch -m master
-          git push -f
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: scmanjarrez/cvescanner:db,scmanjarrez/cvescanner:latest
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          git push -f origin master
