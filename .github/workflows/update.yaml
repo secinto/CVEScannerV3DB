@@ -101,6 +101,7 @@ jobs:
           # database.py reads the NVD key from the NVD_KEY env var.
           NVD_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
+          set -o pipefail
           if [ -z "$NVD_KEY" ]; then
             echo "::error::NVD_API_KEY secret is not set." >&2
             exit 1
@@ -114,22 +115,32 @@ jobs:
           CURATED="$GITHUB_WORKSPACE/scanner/extra/curated_dispositions.json"
           CURATED_ARGS=()
           if [ -f "$CURATED" ]; then CURATED_ARGS=(--curated "$CURATED"); fi
-          # OSV/Red Hat backports are always refreshed in full (cheap vs NVD).
+          UPD_LOG="$RUNNER_TEMP/nvd_update.log"
+          # -ns/--noscrape skips the exploit-db.com name scrape: it's WAF-rate-
+          # limited (~64s/batch, ~1h+ per run), fragile, and the scraped *names*
+          # are not needed for CVE matching. OSV/Red Hat backports are always
+          # refreshed in full (cheap vs NVD).
           run_update() {
             python3 scanner/extra/database.py \
               -d cve.db \
+              -ns \
               --backports \
               --ecosystems "$BACKPORT_ECOSYSTEMS" \
               --redhat \
               --redhat-packages "$REDHAT_PACKAGES" \
               --redhat-releases "$REDHAT_RELEASES" \
-              "${CURATED_ARGS[@]}"
+              "${CURATED_ARGS[@]}" 2>&1 | tee "$UPD_LOG"
           }
-          # NVD's API (behind Cloudflare) intermittently returns 503/timeouts and
-          # database.py exits on the first non-200 with no retry. Retry the whole
-          # update with exponential backoff so a transient outage doesn't fail the
-          # scheduled job. Each full attempt starts from a clean DB; incremental
-          # attempts reuse the reassembled base.
+          # Why a completeness gate, not just exit-on-success:
+          # query_api in database.py SWALLOWS per-batch failures — when NVD (behind
+          # Cloudflare) returns an HTML 503 instead of JSON, resp.json() throws, the
+          # batch's ~2000 CVEs are dropped, yet the command still exits 0 and the
+          # progress bar still reaches 100%. So "success" can mean a half-empty DB
+          # (we saw 58k ingested of 359k reported). For a full rebuild we therefore
+          # compare the ingested CVE count against NVD's own reported total (parsed
+          # from database.py's metadata line) and only accept >=90% (rejected/
+          # deferred CVEs are intentionally skipped, so it never reaches 100%).
+          # Anything short is treated as a dropped-batch partial and retried.
           attempts=5
           delay=30
           for i in $(seq 1 "$attempts"); do
@@ -140,16 +151,29 @@ jobs:
               echo "==> INCREMENTAL update (attempt $i/$attempts)"
             fi
             if run_update; then
-              echo "NVD update succeeded on attempt $i"
-              exit 0
+              INGESTED=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;" 2>/dev/null || echo 0)
+              REPORTED=$(grep -oE 'Metadata: [0-9]+ CPEs \| [0-9]+ CVEs' "$UPD_LOG" | tail -1 | grep -oE '[0-9]+ CVEs' | grep -oE '[0-9]+' || true)
+              if [ "$FULL" = true ] && [ -n "$REPORTED" ] && [ "$REPORTED" -gt 0 ]; then
+                THRESH=$(( REPORTED * 90 / 100 ))
+                if [ "${INGESTED:-0}" -ge "$THRESH" ]; then
+                  echo "Complete on attempt $i: ingested $INGESTED of $REPORTED reported CVEs (>= $THRESH)"
+                  exit 0
+                fi
+                echo "::warning::Incomplete ingest on attempt $i: $INGESTED of $REPORTED CVEs (need >= $THRESH) — NVD dropped batches; retrying"
+              else
+                echo "Update succeeded on attempt $i (ingested ${INGESTED:-0} CVEs, reported='${REPORTED:-?}')"
+                exit 0
+              fi
+            else
+              echo "::warning::NVD update command failed on attempt $i"
             fi
             if [ "$i" -lt "$attempts" ]; then
-              echo "::warning::NVD update attempt $i failed; retrying in ${delay}s"
+              echo "Retrying in ${delay}s"
               sleep "$delay"
               delay=$((delay * 2))
             fi
           done
-          echo "::error::NVD update failed after $attempts attempts (likely a sustained NVD outage)." >&2
+          echo "::error::NVD update did not complete after $attempts attempts (sustained NVD 503s / dropped batches)." >&2
           exit 1
 
       - name: Sanity-check the database
