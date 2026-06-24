@@ -131,22 +131,22 @@ jobs:
               --redhat-releases "$REDHAT_RELEASES" \
               "${CURATED_ARGS[@]}" 2>&1 | tee "$UPD_LOG"
           }
-          # Why a completeness gate, not just exit-on-success:
-          # database.py can still finish "successfully" with a partial DB — if NVD
-          # (behind Cloudflare) keeps returning 429/HTML-503 for some batches even
-          # after CVEScannerV3's per-batch retries, those records are dropped while
-          # the command exits 0. So for a full rebuild we compare the ingested CVE
-          # count against NVD's own reported total (parsed from database.py's
-          # metadata line) and only accept >=90% (rejected/deferred CVEs are
-          # intentionally skipped, so it never reaches 100%).
+          # Completeness gate — measure DROPPED BATCHES, not a count ratio.
+          # database.py intentionally skips CVEs whose vulnStatus is "deferred"
+          # or "rejected", so the cves table never approaches NVD's reported
+          # total: e.g. 360,196 reported = ~305k kept + ~17.6k rejected + ~37.3k
+          # deferred (~15% excluded). A ">=90% of reported" gate therefore can
+          # never pass and wrongly rejects complete runs.
           #
-          # The heavy lifting against transient NVD flakiness now lives in
-          # CVEScannerV3 (per-request retry/backoff in query_api + the metadata
-          # preflight). This outer loop is just a light backstop: a full rebuild
-          # re-fetches all ~360k CVEs, so each attempt costs ~1.5-2h during an NVD
-          # outage — keep attempts low or the job blows GitHub's hard 6h cap.
-          # During a genuine sustained NVD outage no number of retries helps;
-          # failing fast and waiting for NVD to recover is the correct outcome.
+          # The true incompleteness signal is whether any batch was abandoned
+          # after CVEScannerV3's per-request retries. nvd_get_json logs
+          # "NVD request failed after N attempts" (or "NVD API returned HTTP")
+          # for each batch it gives up on. Zero such lines => every batch NVD
+          # served was ingested => the DB holds the complete non-deferred set.
+          # A FLOOR guards against a catastrophic partial that somehow logged no
+          # give-ups. attempts stay low: a full rebuild re-fetches ~360k CVEs
+          # (~1.5-2h), and GitHub hard-caps the job at 6h.
+          FLOOR=250000
           attempts=2
           delay=120
           for i in $(seq 1 "$attempts"); do
@@ -159,15 +159,15 @@ jobs:
             if run_update; then
               INGESTED=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;" 2>/dev/null || echo 0)
               REPORTED=$(grep -oE 'Metadata: [0-9]+ CPEs \| [0-9]+ CVEs' "$UPD_LOG" | tail -1 | grep -oE '[0-9]+ CVEs' | grep -oE '[0-9]+' || true)
-              if [ "$FULL" = true ] && [ -n "$REPORTED" ] && [ "$REPORTED" -gt 0 ]; then
-                THRESH=$(( REPORTED * 90 / 100 ))
-                if [ "${INGESTED:-0}" -ge "$THRESH" ]; then
-                  echo "Complete on attempt $i: ingested $INGESTED of $REPORTED reported CVEs (>= $THRESH)"
+              ABANDONED=$(grep -cE 'NVD request failed after|NVD API returned HTTP' "$UPD_LOG" || true)
+              if [ "$FULL" = true ]; then
+                if [ "${ABANDONED:-0}" -eq 0 ] && [ "${INGESTED:-0}" -ge "$FLOOR" ]; then
+                  echo "Complete on attempt $i: ingested $INGESTED CVEs, 0 abandoned batches (reported $REPORTED incl. deferred/rejected)"
                   exit 0
                 fi
-                echo "::warning::Incomplete ingest on attempt $i: $INGESTED of $REPORTED CVEs (need >= $THRESH) — NVD dropped batches; retrying"
+                echo "::warning::Incomplete on attempt $i: ingested $INGESTED CVEs, ${ABANDONED:-0} abandoned batch(es), floor $FLOOR — retrying"
               else
-                echo "Update succeeded on attempt $i (ingested ${INGESTED:-0} CVEs, reported='${REPORTED:-?}')"
+                echo "Update succeeded on attempt $i (ingested ${INGESTED:-0} CVEs, ${ABANDONED:-0} abandoned batches)"
                 exit 0
               fi
             else
@@ -179,7 +179,7 @@ jobs:
               delay=$((delay * 2))
             fi
           done
-          echo "::error::NVD update did not complete after $attempts attempts (sustained NVD 503s / dropped batches)." >&2
+          echo "::error::NVD update did not complete after $attempts attempts (abandoned batches / below floor)." >&2
           exit 1
 
       - name: Sanity-check the database
