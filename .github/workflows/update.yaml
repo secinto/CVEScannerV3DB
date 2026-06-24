@@ -132,17 +132,23 @@ jobs:
               "${CURATED_ARGS[@]}" 2>&1 | tee "$UPD_LOG"
           }
           # Why a completeness gate, not just exit-on-success:
-          # query_api in database.py SWALLOWS per-batch failures — when NVD (behind
-          # Cloudflare) returns an HTML 503 instead of JSON, resp.json() throws, the
-          # batch's ~2000 CVEs are dropped, yet the command still exits 0 and the
-          # progress bar still reaches 100%. So "success" can mean a half-empty DB
-          # (we saw 58k ingested of 359k reported). For a full rebuild we therefore
-          # compare the ingested CVE count against NVD's own reported total (parsed
-          # from database.py's metadata line) and only accept >=90% (rejected/
-          # deferred CVEs are intentionally skipped, so it never reaches 100%).
-          # Anything short is treated as a dropped-batch partial and retried.
-          attempts=5
-          delay=30
+          # database.py can still finish "successfully" with a partial DB — if NVD
+          # (behind Cloudflare) keeps returning 429/HTML-503 for some batches even
+          # after CVEScannerV3's per-batch retries, those records are dropped while
+          # the command exits 0. So for a full rebuild we compare the ingested CVE
+          # count against NVD's own reported total (parsed from database.py's
+          # metadata line) and only accept >=90% (rejected/deferred CVEs are
+          # intentionally skipped, so it never reaches 100%).
+          #
+          # The heavy lifting against transient NVD flakiness now lives in
+          # CVEScannerV3 (per-request retry/backoff in query_api + the metadata
+          # preflight). This outer loop is just a light backstop: a full rebuild
+          # re-fetches all ~360k CVEs, so each attempt costs ~1.5-2h during an NVD
+          # outage — keep attempts low or the job blows GitHub's hard 6h cap.
+          # During a genuine sustained NVD outage no number of retries helps;
+          # failing fast and waiting for NVD to recover is the correct outcome.
+          attempts=2
+          delay=120
           for i in $(seq 1 "$attempts"); do
             if [ "$FULL" = true ]; then
               echo "==> FULL rebuild (attempt $i/$attempts)"
