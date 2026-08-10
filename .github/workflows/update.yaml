@@ -41,6 +41,14 @@ jobs:
       BACKPORT_ECOSYSTEMS: "Debian:13,Debian:12,Debian:11,Ubuntu:24.04:LTS,Ubuntu:22.04:LTS,Ubuntu:20.04:LTS,AlmaLinux:8,AlmaLinux:9,AlmaLinux:10"
       REDHAT_PACKAGES: "openssh,httpd,openssl,bind,nginx"
       REDHAT_RELEASES: "7,8,9,10"
+      # Canonical's tracker is the primary Ubuntu backport source. The OSV
+      # Ubuntu buckets above are built from Ubuntu Security *Notices*, so they
+      # carry only CVEs that got a published USN — no not-affected verdicts and
+      # no silent SRU fixes. That is why OSV holds 5 openssh rows for 24.04
+      # against Debian 12's 82, despite the bucket having 81k rows overall.
+      # Keep these in sync with CVE_UBUNTU_* in the monorepo's build-cve-db.sh.
+      UBUNTU_PACKAGES: "openssh,apache2,openssl,bind9,nginx"
+      UBUNTU_RELEASES: "24.04,22.04,20.04"
     steps:
       - name: Check out database repository
         uses: actions/checkout@v4
@@ -129,6 +137,9 @@ jobs:
               --redhat \
               --redhat-packages "$REDHAT_PACKAGES" \
               --redhat-releases "$REDHAT_RELEASES" \
+              --ubuntu \
+              --ubuntu-packages "$UBUNTU_PACKAGES" \
+              --ubuntu-releases "$UBUNTU_RELEASES" \
               "${CURATED_ARGS[@]}" 2>&1 | tee "$UPD_LOG"
           }
           # Completeness gate — measure DROPPED BATCHES, not a count ratio.
