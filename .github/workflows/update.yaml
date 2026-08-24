@@ -53,6 +53,27 @@ jobs:
       - name: Check out database repository
         uses: actions/checkout@v4
 
+      - name: Guard the completeness gate
+        run: |
+          # This repo's history is replaced on every update (orphan commit +
+          # force-push in "Commit refreshed dumps"), so there is no diff between
+          # database updates and a hand-made regression to this file leaves
+          # nothing to review. #5's gate was lost exactly that way: a manual
+          # snapshot reconciliation on 2026-08-03 resolved this file back to its
+          # pre-#5 version, and the next scheduled run propagated it unnoticed
+          # until 2026-08-24. Assert the gate's shape here, in seconds, before
+          # committing to ~2h of NVD ingest.
+          WF=.github/workflows/update.yaml
+          fail() { echo "::error::$1" >&2; exit 1; }
+          grep -q 'ABANDONED=' "$WF" \
+            || fail "completeness gate regressed: abandoned-batch check missing (see #5)"
+          grep -q 'FLOOR=' "$WF" \
+            || fail "completeness gate regressed: FLOOR backstop missing (see #5)"
+          if grep -q 'REPORTED \* 90 / 100' "$WF"; then
+            fail "completeness gate regressed to the >=90%-of-reported ratio, which can never pass: database.py skips deferred/rejected CVEs (~15% of the feed), so a complete run lands near 85%"
+          fi
+          echo "Completeness gate intact (abandoned-batch + FLOOR)."
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
