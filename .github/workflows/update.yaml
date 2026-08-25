@@ -239,12 +239,68 @@ jobs:
           path: cve.db
           retention-days: 15
 
+      - name: Preserve the code on a branch that keeps history
+        run: |
+          # The orphan commit below exists to stop ~369 MB of dumps
+          # accumulating, and that part is right. But it takes the code with
+          # it: master ends up one commit deep, so there is no diff between
+          # database updates and a regression to this workflow leaves nothing
+          # to review. That is how the completeness gate from #5 was lost — a
+          # manual reconciliation on 2026-08-03 reverted it and the next
+          # scheduled run carried the revert forward unnoticed until #6.
+          #
+          # The non-dump files are 52 KB against that 369 MB, so keeping their
+          # real history costs nothing the orphan was protecting against.
+          #
+          # Built with plumbing on a temporary index: no checkout, so a 369 MB
+          # working tree is never rewritten just to record 52 KB. Runs BEFORE
+          # the orphan, while HEAD still has the code.
+          set -euo pipefail
+          CODE_FILES=$(git ls-tree -r HEAD --name-only | grep -v '^dump\.')
+          if [ -z "$CODE_FILES" ]; then
+            echo "::warning::no non-dump files found; skipping code-history"
+            exit 0
+          fi
+
+          GIT_INDEX_FILE=$(mktemp -u); export GIT_INDEX_FILE
+          git read-tree --empty
+          echo "$CODE_FILES" | xargs -r git update-index --add --
+          CODE_TREE=$(git write-tree)
+          rm -f "$GIT_INDEX_FILE"; unset GIT_INDEX_FILE
+
+          git fetch -q origin code-history 2>/dev/null || true
+          PARENT=$(git rev-parse --verify -q FETCH_HEAD 2>/dev/null || true)
+
+          # No empty commit when the code did not move: most updates change
+          # only the dumps, and 26 empty commits a year would bury the ones
+          # that matter.
+          if [ -n "$PARENT" ] && [ "$(git rev-parse "$PARENT^{tree}")" = "$CODE_TREE" ]; then
+            echo "code-history: unchanged since $(git rev-parse --short "$PARENT"), nothing to record"
+            exit 0
+          fi
+
+          MSG="Code as of the ${{ steps.mode.outputs.mode }} database update - $(date -u +%Y-%m-%d)
+
+          Snapshot of the non-dump files, taken before the orphan commit that
+          replaces master. master keeps no history by design; this branch is
+          where a change to the workflows, README or build.sh can be diffed."
+
+          if [ -n "$PARENT" ]; then
+            COMMIT=$(git commit-tree "$CODE_TREE" -p "$PARENT" -m "$MSG")
+          else
+            COMMIT=$(git commit-tree "$CODE_TREE" -m "$MSG")
+          fi
+          git push -q origin "$COMMIT:refs/heads/code-history"
+          echo "code-history: recorded $(git rev-parse --short "$COMMIT")"
+
       - name: Commit refreshed dumps
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # cve.db is gitignored; only the dump.p* parts are tracked.
-          # Orphan-commit keeps the repo small despite ~150 MB of binary dumps.
+          # Orphan-commit keeps the repo small despite ~369 MB of binary dumps.
+          # The code's history is preserved on code-history by the step above,
+          # so this discards only the dump snapshots it is meant to.
           git checkout --orphan latest
           git add -A
           git commit -m "Update CVE database (${{ steps.mode.outputs.mode }} + backports) - $(date -u +%Y-%m-%d)"
