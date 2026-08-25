@@ -240,6 +240,10 @@ jobs:
           retention-days: 15
 
       - name: Preserve the code on a branch that keeps history
+        # Backstop for anything unforeseen in the step below: recording history
+        # is secondary to shipping the database, and this runs before the
+        # commit that publishes it.
+        continue-on-error: true
         run: |
           # The orphan commit below exists to stop ~369 MB of dumps
           # accumulating, and that part is right. But it takes the code with
@@ -256,15 +260,18 @@ jobs:
           # working tree is never rewritten just to record 52 KB. Runs BEFORE
           # the orphan, while HEAD still has the code.
           set -euo pipefail
-          CODE_FILES=$(git ls-tree -r HEAD --name-only | grep -v '^dump\.')
-          if [ -z "$CODE_FILES" ]; then
+          # NUL-delimited throughout: a path with a space would otherwise be
+          # split by xargs into two nonexistent paths, and `git update-index`
+          # exits non-zero on those, taking the whole job down with it.
+          if [ -z "$(git ls-tree -r -z HEAD --name-only | grep -zv '^dump\.' | tr -d '\0')" ]; then
             echo "::warning::no non-dump files found; skipping code-history"
             exit 0
           fi
 
           GIT_INDEX_FILE=$(mktemp -u); export GIT_INDEX_FILE
           git read-tree --empty
-          echo "$CODE_FILES" | xargs -r git update-index --add --
+          git ls-tree -r -z HEAD --name-only | grep -zv '^dump\.' \
+            | xargs -0 -r git update-index --add --
           CODE_TREE=$(git write-tree)
           rm -f "$GIT_INDEX_FILE"; unset GIT_INDEX_FILE
 
@@ -290,8 +297,15 @@ jobs:
           else
             COMMIT=$(git commit-tree "$CODE_TREE" -m "$MSG")
           fi
-          git push -q origin "$COMMIT:refs/heads/code-history"
-          echo "code-history: recorded $(git rev-parse --short "$COMMIT")"
+          # Never fatal. This step runs before "Commit refreshed dumps", so
+          # aborting here would throw away a rebuild that costs 1-2h of NVD
+          # ingest — a disproportionate price for failing to record 52 KB.
+          # The warning is visible in the run summary.
+          if git push -q origin "$COMMIT:refs/heads/code-history"; then
+            echo "code-history: recorded $(git rev-parse --short "$COMMIT")"
+          else
+            echo "::warning::could not push code-history; the database update continues, but this update's code is unrecorded"
+          fi
 
       - name: Commit refreshed dumps
         run: |
