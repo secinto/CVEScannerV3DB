@@ -1,0 +1,4 @@
+cve.db
+# Build tooling cloned by .github/workflows/update.yaml; "git add -A" in the
+# commit step would otherwise track it as a gitlink (it did, at 330acf7).
+scanner/
