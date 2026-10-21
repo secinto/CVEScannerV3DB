@@ -92,6 +92,24 @@ jobs:
           fi
           echo "Completeness gate intact (refresh-raw + FLOOR)."
 
+      - name: Guard the code against silent drift
+        run: |
+          # The step above protects one feature of one file. This one covers
+          # every tracked non-dump file: master's code must equal the tip of
+          # code-history, the branch that keeps real history. A deliberate
+          # change lands on both in one atomic push (code-history.sh record,
+          # see CLAUDE.md), so it passes; a change that reached master any
+          # other way (a reconciliation like 2026-08-03's, a hand edit, a
+          # stray file a run committed) fails here with the diff, before the
+          # NVD fetch and long before the orphan force-push makes it permanent.
+          set -euo pipefail
+          if ! git ls-remote --exit-code origin refs/heads/code-history >/dev/null; then
+            echo "::warning::no code-history branch yet; nothing to compare with (the 'Preserve the code' step creates it)"
+            exit 0
+          fi
+          git fetch -q --no-tags --depth=1 origin +refs/heads/code-history:refs/remotes/origin/code-history
+          .github/scripts/code-history.sh check
+
       - name: Configure git identity
         # Before anything commits: "Preserve the code" runs git commit-tree,
         # which failed with "empty ident name" while this was set only in the
@@ -343,8 +361,19 @@ jobs:
           # Orphan-commit keeps the repo small despite ~369 MB of binary dumps.
           # The code's history is preserved on code-history by the step above,
           # so this discards only the dump snapshots it is meant to.
+          set -euo pipefail
           git checkout --orphan latest
           git add -A
+          # Last look before the force-push: "add -A" stages anything the run
+          # left untracked and not ignored (the scanner/ gitlink at 330acf7
+          # came in this way), which would then reach master without ever
+          # reaching code-history. The database is already published as a
+          # release asset, so stopping here costs only this dump refresh.
+          if git fetch -q --no-tags --depth=1 origin +refs/heads/code-history:refs/remotes/origin/code-history; then
+            .github/scripts/code-history.sh check --cached
+          else
+            echo "::warning::code-history not fetchable; committing without the drift check"
+          fi
           git commit -m "Update CVE database (${{ steps.mode.outputs.mode }} + backports) - $(date -u +%Y-%m-%d)"
           git branch -D master
           git branch -m master

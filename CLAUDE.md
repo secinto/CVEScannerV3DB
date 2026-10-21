@@ -9,6 +9,23 @@ survive that (`add -A` restages them); commit *history* does not. The code's his
 preserved separately on the `code-history` branch by the step above it. So: never expect
 `git log` here to show anything, and never keep unmerged work on a local branch.
 
+**A code change lands on master and code-history together.** Every run starts with
+"Guard the code against silent drift": master's non-dump files must equal the tip of
+`code-history`, or the run fails and prints the diff. That is what catches a silent
+regression like the 2026-08-03 revert of `update.yaml`. So a deliberate change goes in
+like this, and never as a plain `git push` to master:
+
+```bash
+git fetch origin && git reset --hard origin/master   # never rebase here
+# edit, then:
+git commit -am "fix: ..."
+.github/scripts/code-history.sh record   # atomic push: master + a code-history commit with the same code
+```
+
+`code-history.sh check` runs the same comparison locally (after `git fetch origin`). If a
+run fails the guard, either record the change with `record` (it was intended) or restore
+the files from `origin/code-history` (it was not).
+
 Part of the CheckFix tool group under `/checkfix/tools`. Build and test commands live in
 this repo's `README.md` / `Makefile`; document them here as they stabilise.
 
