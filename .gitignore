@@ -6,3 +6,6 @@ scanner/
 nvd-raw/
 *.zst
 stamp.json
+# Local beads issue database (bd init); issues sync via refs/dolt/data, never as files.
+.beads/
+.beads.gate.lock
