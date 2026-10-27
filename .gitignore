@@ -1,0 +1,17 @@
+cve.db
+# Build tooling cloned by .github/workflows/update.yaml; "git add -A" in the
+# commit step would otherwise track it as a gitlink (it did, at 330acf7).
+scanner/
+# Produced by update.yaml and published as release assets, never committed.
+nvd-raw/
+*.zst
+stamp.json
+# Local beads issue database (bd init); issues sync via refs/dolt/data, never as files.
+.beads/
+.beads.gate.lock
+# Agent integration files bd init writes; kept local, not part of this repo.
+AGENTS.md
+.agents/
+.claude/
+.codex/
+.cursor/
