@@ -18,6 +18,9 @@ name: Update CVE database (NVD raw cache + backports)
 #
 # Requires repository secret: NVD_API_KEY  (Settings -> Secrets and variables ->
 # Actions). Get a key at https://nvd.nist.gov/developers/request-an-api-key.
+# Requires repository secret: SCANNER_DEPLOY_KEY, the private half of a
+# read-only deploy key on secinto/CVEScannerV3 (private since 2026-11-01, so
+# github.token cannot clone it).
 
 on:
   workflow_dispatch:
@@ -47,7 +50,7 @@ jobs:
     timeout-minutes: 360
     env:
       # secinto fork that carries update-db + backports/redhat/curated tooling.
-      SCANNER_REPO: https://github.com/secinto/CVEScannerV3.git
+      SCANNER_REPO: secinto/CVEScannerV3
       DB_RELEASE: cve-db
       RAW_RELEASE: nvd-raw
       GH_TOKEN: ${{ github.token }}
@@ -129,8 +132,15 @@ jobs:
           sudo apt-get install -y sqlite3 zstd
 
       - name: Clone CVEScannerV3 (build tooling)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SCANNER_REPO }}
+          ssh-key: ${{ secrets.SCANNER_DEPLOY_KEY }}
+          persist-credentials: false
+          path: scanner
+
+      - name: Install the build tooling's Python dependencies
         run: |
-          git clone --depth 1 "$SCANNER_REPO" scanner
           python3 -m pip install --upgrade pip
           pip install -r scanner/extra/requirements.txt
 
