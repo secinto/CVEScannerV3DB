@@ -199,7 +199,8 @@ jobs:
           delay=120
           for i in $(seq 1 "$attempts"); do
             echo "==> ${{ steps.mode.outputs.mode }} run (attempt $i/$attempts)"
-            if python3 scanner/extra/database.py \
+            rc=0
+            python3 scanner/extra/database.py \
                 -d cve.db \
                 --raw-dir nvd-raw --refresh-raw --from-raw \
                 "${FULL_ARGS[@]}" \
@@ -212,15 +213,24 @@ jobs:
                 --ubuntu \
                 --ubuntu-packages "$UBUNTU_PACKAGES" \
                 --ubuntu-releases "$UBUNTU_RELEASES" \
-                "${CURATED_ARGS[@]}"; then
+                "${CURATED_ARGS[@]}" || rc=$?
+            if [ "$rc" -eq 0 ]; then
               INGESTED=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;" 2>/dev/null || echo 0)
               if [ "${INGESTED:-0}" -ge "$FLOOR" ]; then
                 echo "Complete on attempt $i: $INGESTED CVEs; raw cache $(tr -d '\n' < nvd-raw/meta.json)"
                 exit 0
               fi
               echo "::warning::only $INGESTED CVEs on attempt $i (floor $FLOOR)"
+            elif [ "$rc" -eq 3 ]; then
+              # Exit 3: the backports are complete except for a stale part (an
+              # OSV ecosystem, a Red Hat or Canonical package; CVEScannerV3
+              # PR #36), and build_info.backports_stale names it. That part
+              # keeps the rows it had before the run, but a --from-raw build
+              # has none, so its rows are missing: never publish this database.
+              STALE=$(sqlite3 cve.db "SELECT value FROM build_info WHERE key = 'backports_stale';" 2>/dev/null || true)
+              echo "::warning::database.py exited 3 on attempt $i: backports incomplete, stale: ${STALE:-(not stamped)}. Not publishing a database that lacks those rows."
             else
-              echo "::warning::database.py failed on attempt $i"
+              echo "::warning::database.py failed on attempt $i (exit $rc)"
             fi
             if [ "$i" -lt "$attempts" ]; then
               echo "Retrying in ${delay}s"
