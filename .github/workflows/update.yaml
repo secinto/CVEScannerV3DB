@@ -236,6 +236,14 @@ jobs:
           FLOOR=250000
           max_builds=2
           max_refreshes=2
+          # Start another attempt only when it can end in time. The job has
+          # timeout-minutes 360, and the other steps take a few minutes. A
+          # build takes up to ~2 h (2026-11-15: 95 and 112 min), and so can a
+          # refresh in which a Canonical package uses its whole resume
+          # budget. A run that stops here can still publish (see the end of
+          # this step); a run the timeout kills publishes nothing.
+          STEP_BUDGET=$((330 * 60))
+          ATTEMPT_MAX=$((120 * 60))
           builds=0
           refreshes=0
           delay=120
@@ -294,6 +302,10 @@ jobs:
             fi
             if [ "$next" = build ] && [ "$builds" -ge "$max_builds" ]; then break; fi
             if [ "$next" = refresh ] && [ "$refreshes" -ge "$max_refreshes" ]; then break; fi
+            if [ $((SECONDS + delay + ATTEMPT_MAX)) -gt "$STEP_BUDGET" ]; then
+              echo "::warning::no time for another $next: $((SECONDS / 60)) of $((STEP_BUDGET / 60)) min used, and an attempt can take $((ATTEMPT_MAX / 60))"
+              break
+            fi
             echo "Retrying in ${delay}s"
             sleep "$delay"
             delay=$((delay * 2))
