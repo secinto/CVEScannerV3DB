@@ -47,6 +47,13 @@ downloads `cve.db.zst` only when `db_id` changed. Each run starts from the
 `nvd-raw` cache and asks NVD only for what changed since then, and CVEScannerV3's
 `make compare-rules` uses the same cache offline.
 
+A backports part whose fetch keeps failing (an OSV ecosystem, a Red Hat or
+Canonical package) is stale. The run then refetches only the stale parts, twice
+at most. A part that stays stale keeps the rows and date of the last published
+`cve.db.zst`, and `stamp.json` names it in `backports_stale`, so
+`build-cve-db.sh` refetches the backports after the download. The run publishes
+nothing when a stale part has no rows at all (`backports_stale_empty`).
+
 ```bash
 curl -fL https://github.com/secinto/CVEScannerV3DB/releases/download/cve-db/cve.db.zst | zstd -dc > cve.db
 ```
