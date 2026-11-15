@@ -229,6 +229,15 @@ jobs:
               # has none, so its rows are missing: never publish this database.
               STALE=$(sqlite3 cve.db "SELECT value FROM build_info WHERE key = 'backports_stale';" 2>/dev/null || true)
               echo "::warning::database.py exited 3 on attempt $i: backports incomplete, stale: ${STALE:-(not stamped)}. Not publishing a database that lacks those rows."
+            elif [ "$rc" -eq 2 ]; then
+              # Exit 2: a configuration error (an invalid ecosystem, an option
+              # that needs another one; CVEScannerV3 PR #38), or a command
+              # line that argparse or python3 rejects. It fails the same way
+              # on every run, so do not wait and retry. Exit 1 keeps the
+              # retry: it is also an NVD page that failed twice, and the next
+              # attempt resumes the refresh with the pages it has.
+              echo "::error::database.py exited 2 on attempt $i: a configuration error (its last output line names it). A retry cannot fix it, so there is none." >&2
+              exit 1
             else
               echo "::warning::database.py failed on attempt $i (exit $rc)"
             fi
