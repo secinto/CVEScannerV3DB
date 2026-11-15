@@ -169,6 +169,25 @@ jobs:
             rm -rf nvd-raw && mkdir -p nvd-raw
           fi
 
+      - name: Fetch the last published database (rows for a stale backports part)
+        run: |
+          # A backports part whose fetch keeps failing (an OSV ecosystem, a
+          # Red Hat or Canonical package) is stale: it keeps the rows the
+          # database had before the run. cve.db is built from the raw cache
+          # and has none, so database.py takes them from the database this
+          # workflow published last (--previous-db). Without it, a stale part
+          # holds no rows, and the run cannot publish (run 43703334465,
+          # 2026-11-15: ubuntu-security:mariadb).
+          set -o pipefail
+          if gh release download "$DB_RELEASE" -p cve.db.zst -O - 2>/dev/null \
+              | zstd -dc > cve.prev.db \
+              && BP=$(sqlite3 cve.prev.db "SELECT COUNT(*) FROM backports;" 2>/dev/null); then
+            echo "Last published database: db_id $(sqlite3 cve.prev.db "SELECT value FROM build_info WHERE key = 'db_id';"), $BP backport rows"
+          else
+            echo "::warning::no usable database in release $DB_RELEASE; a stale backports part will hold no rows, and then this run cannot publish"
+            rm -f cve.prev.db
+          fi
+
       - name: Refresh the raw cache and rebuild cve.db
         env:
           # database.py reads the NVD key from the NVD_KEY env var.
@@ -179,11 +198,25 @@ jobs:
             echo "::error::NVD_API_KEY secret is not set." >&2
             exit 1
           fi
+          # The last published database is only needed in this step.
+          trap 'rm -f cve.prev.db' EXIT
+          MODE="${{ steps.mode.outputs.mode }}"
           FULL_ARGS=()
-          if [ "${{ steps.mode.outputs.mode }}" = "full" ]; then FULL_ARGS=(--full); fi
+          if [ "$MODE" = "full" ]; then FULL_ARGS=(--full); fi
           CURATED="$GITHUB_WORKSPACE/scanner/extra/curated_dispositions.json"
           CURATED_ARGS=()
           if [ -f "$CURATED" ]; then CURATED_ARGS=(--curated "$CURATED"); fi
+          PREVIOUS_ARGS=()
+          if [ -f cve.prev.db ]; then PREVIOUS_ARGS=(--previous-db cve.prev.db); fi
+          # The build and the refresh of its stale parts take the same
+          # backport options: --refresh-stale refuses another config.
+          BACKPORT_ARGS=(
+            --ecosystems "$BACKPORT_ECOSYSTEMS"
+            --redhat --redhat-packages "$REDHAT_PACKAGES" --redhat-releases "$REDHAT_RELEASES"
+            --ubuntu --ubuntu-packages "$UBUNTU_PACKAGES" --ubuntu-releases "$UBUNTU_RELEASES"
+            "${CURATED_ARGS[@]}"
+          )
+          stamp() { sqlite3 cve.db "SELECT COALESCE((SELECT value FROM build_info WHERE key = '$1'), '(not stamped)');" 2>/dev/null || echo "(unreadable)"; }
           # -ns/--noscrape skips the exploit-db.com name scrape: it's WAF-rate-
           # limited (~64s/batch, ~1h+ per run), fragile, and the scraped *names*
           # are not needed for CVE matching. OSV/Red Hat/Ubuntu backports are
@@ -194,41 +227,58 @@ jobs:
           # guards against a catastrophic partial that somehow got through.
           # database.py skips deferred/rejected CVEs (~15% of the feed), so
           # the cves table stays well below NVD's reported total.
+          #
+          # Retries: exit 1 (an NVD page that failed twice, an outage) builds
+          # again; the next build resumes the raw-cache refresh with the pages
+          # it has. Exit 3 (a stale backports part, see below) refetches only
+          # the stale parts (--refresh-stale), in minutes instead of a 1.5 h
+          # rebuild. Exit 2 (a configuration error) is not retried.
           FLOOR=250000
-          attempts=2
+          max_builds=2
+          max_refreshes=2
+          builds=0
+          refreshes=0
           delay=120
-          for i in $(seq 1 "$attempts"); do
-            echo "==> ${{ steps.mode.outputs.mode }} run (attempt $i/$attempts)"
+          next=build
+          while :; do
             rc=0
-            python3 scanner/extra/database.py \
-                -d cve.db \
-                --raw-dir nvd-raw --refresh-raw --from-raw \
-                "${FULL_ARGS[@]}" \
-                -ns \
-                --backports \
-                --ecosystems "$BACKPORT_ECOSYSTEMS" \
-                --redhat \
-                --redhat-packages "$REDHAT_PACKAGES" \
-                --redhat-releases "$REDHAT_RELEASES" \
-                --ubuntu \
-                --ubuntu-packages "$UBUNTU_PACKAGES" \
-                --ubuntu-releases "$UBUNTU_RELEASES" \
-                "${CURATED_ARGS[@]}" || rc=$?
+            if [ "$next" = build ]; then
+              builds=$((builds + 1))
+              echo "==> $MODE build (attempt $builds/$max_builds)"
+              python3 scanner/extra/database.py \
+                  -d cve.db \
+                  --raw-dir nvd-raw --refresh-raw --from-raw \
+                  "${FULL_ARGS[@]}" \
+                  -ns \
+                  --backports "${BACKPORT_ARGS[@]}" \
+                  "${PREVIOUS_ARGS[@]}" || rc=$?
+            else
+              refreshes=$((refreshes + 1))
+              echo "==> refresh of the stale backports parts (attempt $refreshes/$max_refreshes)"
+              python3 scanner/extra/database.py \
+                  -d cve.db \
+                  --refresh-stale "${BACKPORT_ARGS[@]}" || rc=$?
+            fi
             if [ "$rc" -eq 0 ]; then
               INGESTED=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;" 2>/dev/null || echo 0)
               if [ "${INGESTED:-0}" -ge "$FLOOR" ]; then
-                echo "Complete on attempt $i: $INGESTED CVEs; raw cache $(tr -d '\n' < nvd-raw/meta.json)"
+                echo "Complete after $builds build(s) and $refreshes refresh(es): $INGESTED CVEs; raw cache $(tr -d '\n' < nvd-raw/meta.json)"
                 exit 0
               fi
-              echo "::warning::only $INGESTED CVEs on attempt $i (floor $FLOOR)"
+              echo "::warning::only $INGESTED CVEs (floor $FLOOR)"
+              next=build
             elif [ "$rc" -eq 3 ]; then
-              # Exit 3: the backports are complete except for a stale part (an
-              # OSV ecosystem, a Red Hat or Canonical package; CVEScannerV3
-              # PR #36), and build_info.backports_stale names it. That part
-              # keeps the rows it had before the run, but a --from-raw build
-              # has none, so its rows are missing: never publish this database.
-              STALE=$(sqlite3 cve.db "SELECT value FROM build_info WHERE key = 'backports_stale';" 2>/dev/null || true)
-              echo "::warning::database.py exited 3 on attempt $i: backports incomplete, stale: ${STALE:-(not stamped)}. Not publishing a database that lacks those rows."
+              # Exit 3: the backports are complete except for the stale parts
+              # (an OSV ecosystem, a Red Hat or Canonical package) that
+              # build_info.backports_stale names. A stale part keeps the rows
+              # of the last published database (--previous-db).
+              # backports_stale_empty names the stale parts that hold no rows
+              # all the same: no database was published before, or it was
+              # unreadable.
+              STALE=$(stamp backports_stale)
+              EMPTY=$(stamp backports_stale_empty)
+              echo "::warning::database.py exited 3: backports stale: $STALE; stale and holding no rows: ${EMPTY:-none}"
+              next=refresh
             elif [ "$rc" -eq 2 ]; then
               # Exit 2: a configuration error (an invalid ecosystem, an option
               # that needs another one; CVEScannerV3 PR #38), or a command
@@ -236,18 +286,37 @@ jobs:
               # on every run, so do not wait and retry. Exit 1 keeps the
               # retry: it is also an NVD page that failed twice, and the next
               # attempt resumes the refresh with the pages it has.
-              echo "::error::database.py exited 2 on attempt $i: a configuration error (its last output line names it). A retry cannot fix it, so there is none." >&2
+              echo "::error::database.py exited 2: a configuration error (its last output line names it). A retry cannot fix it, so there is none." >&2
               exit 1
             else
-              echo "::warning::database.py failed on attempt $i (exit $rc)"
+              echo "::warning::database.py failed (exit $rc)"
+              next=build
             fi
-            if [ "$i" -lt "$attempts" ]; then
-              echo "Retrying in ${delay}s"
-              sleep "$delay"
-              delay=$((delay * 2))
-            fi
+            if [ "$next" = build ] && [ "$builds" -ge "$max_builds" ]; then break; fi
+            if [ "$next" = refresh ] && [ "$refreshes" -ge "$max_refreshes" ]; then break; fi
+            echo "Retrying in ${delay}s"
+            sleep "$delay"
+            delay=$((delay * 2))
           done
-          echo "::error::database update did not complete after $attempts attempts." >&2
+          # Out of attempts with stale parts that all kept rows: publish. The
+          # database is new in every other part, and each stale part has the
+          # rows and backport_metadata date of the last published database,
+          # so it is never worse than that one. backports_stale stays in the
+          # stamp, so build-cve-db.sh refetches the backports after the
+          # download. "(not stamped)" (a database.py without
+          # backports_stale_empty) never counts as "all kept rows".
+          if [ "$rc" -eq 3 ]; then
+            INGESTED=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;" 2>/dev/null || echo 0)
+            if [ -n "$EMPTY" ]; then
+              echo "::error::stale backports parts hold no rows ($EMPTY); not publishing a database that lacks them." >&2
+            elif [ "${INGESTED:-0}" -lt "$FLOOR" ]; then
+              echo "::error::only $INGESTED CVEs (floor $FLOOR); not publishing." >&2
+            else
+              echo "::warning::publishing with stale backports parts ($STALE): they keep the rows of the last published database, and backports_stale names them."
+              exit 0
+            fi
+          fi
+          echo "::error::database update did not complete after $builds build(s) and $refreshes refresh(es)." >&2
           exit 1
 
       - name: Sanity-check the database
