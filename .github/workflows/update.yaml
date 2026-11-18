@@ -59,7 +59,7 @@ jobs:
       RAW_RELEASE: nvd-raw
       GH_TOKEN: ${{ github.token }}
       # Keep these in sync with checkfix_tools_monorepo/scripts/build-cve-db.sh.
-      BACKPORT_ECOSYSTEMS: "Debian:13,Debian:12,Debian:11,Ubuntu:24.04:LTS,Ubuntu:22.04:LTS,Ubuntu:20.04:LTS,AlmaLinux:8,AlmaLinux:9,AlmaLinux:10"
+      BACKPORT_ECOSYSTEMS: "Debian:13,Debian:12,Debian:11,Debian:10,Ubuntu:24.04:LTS,Ubuntu:22.04:LTS,Ubuntu:20.04:LTS,AlmaLinux:8,AlmaLinux:9,AlmaLinux:10"
       REDHAT_PACKAGES: "openssh,httpd,openssl,bind,nginx"
       REDHAT_RELEASES: "7,8,9,10"
       # Canonical's tracker is the primary Ubuntu backport source. The OSV
