@@ -1,0 +1,512 @@
+name: Update CVE database (NVD raw cache + backports)
+
+# Refreshes cve.db and publishes it three ways:
+#   - the dump.p* parts committed here (build.sh reassembles them),
+#   - the release "cve-db": cve.db.zst plus stamp.json (what it was built
+#     from, and its sha256). checkfix_tools_monorepo/scripts/build-cve-db.sh
+#     reads stamp.json first and downloads the database only when it changed,
+#   - the release "nvd-raw": the NVD raw cache (every NVD cve object as
+#     fetched) that the next run, and CVEScannerV3's `make compare-rules`,
+#     start from.
+#
+# Every run rebuilds cve.db from the raw cache, so a change to CVEScannerV3's
+# import rules reaches the database on the next run of any mode; NVD itself is
+# asked only for what changed since the cache's last_mod. An incremental run
+# therefore takes minutes. A FULL run (1st of each month, or on demand)
+# refetches the whole cache to self-heal drift; the cache is also refetched in
+# full when it is missing or older than NVD's 120-day lastMod window allows.
+#
+# Requires repository secret: NVD_API_KEY  (Settings -> Secrets and variables ->
+# Actions). Get a key at https://nvd.nist.gov/developers/request-an-api-key.
+# Requires repository secret: SCANNER_DEPLOY_KEY, the private half of a
+# read-only deploy key on secinto/CVEScannerV3 (private since 2026-11-01, so
+# github.token cannot clone it).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "incremental = NVD delta into the raw cache, full = refetch the whole cache; both rebuild cve.db with the current import rules"
+        type: choice
+        default: incremental
+        options: [incremental, full]
+      accept_drop:
+        description: "Backport parts that may lose more than half of their CVEs in a release, as backports_stale names them (osv:Debian:11,ubuntu-security:openssl). Only for a drop you checked: the drop guard keeps a part stale otherwise"
+        type: string
+        default: ""
+  schedule:
+    # 03:00 UTC on the 1st and 15th. The 1st-of-month run is forced to full
+    # (see the 'Decide mode' step); the 15th is incremental.
+    - cron: "0 3 1,15 * *"
+
+permissions:
+  contents: write
+
+# One run at a time: two runs would both force-push master and clobber each
+# other's release assets.
+concurrency:
+  group: update-database
+  cancel-in-progress: false
+
+jobs:
+  update-database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      # secinto fork that carries update-db + backports/redhat/curated tooling.
+      SCANNER_REPO: secinto/CVEScannerV3
+      DB_RELEASE: cve-db
+      RAW_RELEASE: nvd-raw
+      GH_TOKEN: ${{ github.token }}
+      # Keep these in sync with checkfix_tools_monorepo/scripts/build-cve-db.sh.
+      BACKPORT_ECOSYSTEMS: "Debian:13,Debian:12,Debian:11,Debian:10,Ubuntu:24.04:LTS,Ubuntu:22.04:LTS,Ubuntu:20.04:LTS,AlmaLinux:8,AlmaLinux:9,AlmaLinux:10"
+      REDHAT_PACKAGES: "openssh,httpd,openssl,bind,nginx"
+      REDHAT_RELEASES: "7,8,9,10"
+      # Canonical's tracker is the primary Ubuntu backport source. The OSV
+      # Ubuntu buckets above are built from Ubuntu Security *Notices*, so they
+      # carry only CVEs that got a published USN — no not-affected verdicts and
+      # no silent SRU fixes. That is why OSV holds 5 openssh rows for 24.04
+      # against Debian 12's 82, despite the bucket having 81k rows overall.
+      # Keep these in sync with CVE_UBUNTU_* in the monorepo's build-cve-db.sh.
+      UBUNTU_PACKAGES: "openssh,apache2,openssl,bind9,nginx,mariadb,mariadb-10.6,mariadb-10.3,mysql-8.0,exim4"
+      UBUNTU_RELEASES: "24.04,22.04,20.04"
+    steps:
+      - name: Check out database repository
+        uses: actions/checkout@v7
+
+      - name: Guard the completeness gate
+        run: |
+          # This repo's history is replaced on every update (orphan commit +
+          # force-push in "Commit refreshed dumps"), so there is no diff between
+          # database updates and a hand-made regression to this file leaves
+          # nothing to review. #5's gate was lost exactly that way: a manual
+          # snapshot reconciliation on 2026-08-03 resolved this file back to its
+          # pre-#5 version, and the next scheduled run propagated it unnoticed
+          # until 2026-08-24. Assert the gate's shape here, in seconds, before
+          # committing to the NVD fetch.
+          #
+          # The gate now has two parts: database.py --refresh-raw fails the
+          # whole refresh when any NVD page fails twice (a cache never has a
+          # hole), and FLOOR catches a catastrophic partial that slipped past.
+          WF=.github/workflows/update.yaml
+          fail() { echo "::error::$1" >&2; exit 1; }
+          grep -q -- '--refresh-raw' "$WF" \
+            || fail "completeness gate regressed: the raw-cache refresh (fails on any lost page) is missing"
+          grep -q 'FLOOR=' "$WF" \
+            || fail "completeness gate regressed: FLOOR backstop missing (see #5)"
+          if grep -q 'REPORTED \* 90 / 100' "$WF"; then
+            fail "completeness gate regressed to the >=90%-of-reported ratio, which can never pass: database.py skips deferred/rejected CVEs (~15% of the feed), so a complete run lands near 85%"
+          fi
+          echo "Completeness gate intact (refresh-raw + FLOOR)."
+
+      - name: Guard the code against silent drift
+        run: |
+          # The step above protects one feature of one file. This one covers
+          # every tracked non-dump file: master's code must equal the tip of
+          # code-history, the branch that keeps real history. A deliberate
+          # change lands on both in one atomic push (code-history.sh record,
+          # see CLAUDE.md), so it passes; a change that reached master any
+          # other way (a reconciliation like 2026-08-03's, a hand edit, a
+          # stray file a run committed) fails here with the diff, before the
+          # NVD fetch and long before the orphan force-push makes it permanent.
+          set -euo pipefail
+          if ! git ls-remote --exit-code origin refs/heads/code-history >/dev/null; then
+            echo "::warning::no code-history branch yet; nothing to compare with (the 'Preserve the code' step creates it)"
+            exit 0
+          fi
+          git fetch -q --no-tags --depth=1 origin +refs/heads/code-history:refs/remotes/origin/code-history
+          .github/scripts/code-history.sh check
+
+      - name: Configure git identity
+        # Before anything commits: "Preserve the code" runs git commit-tree,
+        # which failed with "empty ident name" while this was set only in the
+        # last step, so code-history was never written.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install sqlite3 and zstd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 zstd
+
+      - name: Clone CVEScannerV3 (build tooling)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SCANNER_REPO }}
+          ssh-key: ${{ secrets.SCANNER_DEPLOY_KEY }}
+          persist-credentials: false
+          path: scanner
+
+      - name: Install the build tooling's Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r scanner/extra/requirements.txt
+
+      - name: Decide mode (incremental vs full)
+        id: mode
+        run: |
+          # Priority: manual input > 1st-of-month forced full > incremental.
+          MODE="${{ github.event.inputs.mode }}"
+          if [ -z "$MODE" ]; then
+            if [ "$(date -u +%d)" = "01" ]; then MODE=full; else MODE=incremental; fi
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Selected mode: $MODE"
+
+      - name: Restore the NVD raw cache (incremental only)
+        if: steps.mode.outputs.mode == 'incremental'
+        run: |
+          # No cache yet (first run) or a broken download: database.py then
+          # fetches everything, which is a full run in all but name.
+          mkdir -p nvd-raw
+          if gh release download "$RAW_RELEASE" -p nvd-raw.tar.zst -O - 2>/dev/null \
+              | zstd -dc | tar -x -C nvd-raw; then
+            echo "Raw cache restored: $(tr -d '\n' < nvd-raw/meta.json)"
+          else
+            echo "::warning::no usable raw cache in release $RAW_RELEASE; fetching everything"
+            rm -rf nvd-raw && mkdir -p nvd-raw
+          fi
+
+      - name: Fetch the last published database (rows for a stale backports part)
+        run: |
+          # A backports part whose fetch keeps failing (an OSV ecosystem, a
+          # Red Hat or Canonical package) is stale: it keeps the rows the
+          # database had before the run. cve.db is built from the raw cache
+          # and has none, so database.py takes them from the database this
+          # workflow published last (--previous-db). Without it, a stale part
+          # holds no rows, and the run cannot publish (run 43703334465,
+          # 2026-11-15: ubuntu-security:mariadb).
+          set -o pipefail
+          if gh release download "$DB_RELEASE" -p cve.db.zst -O - 2>/dev/null \
+              | zstd -dc > cve.prev.db \
+              && BP=$(sqlite3 cve.prev.db "SELECT COUNT(*) FROM backports;" 2>/dev/null); then
+            echo "Last published database: db_id $(sqlite3 cve.prev.db "SELECT value FROM build_info WHERE key = 'db_id';"), $BP backport rows"
+          else
+            echo "::warning::no usable database in release $DB_RELEASE; a stale backports part will hold no rows, and then this run cannot publish"
+            rm -f cve.prev.db
+          fi
+
+      - name: Refresh the raw cache and rebuild cve.db
+        env:
+          # database.py reads the NVD key from the NVD_KEY env var.
+          NVD_KEY: ${{ secrets.NVD_API_KEY }}
+          # Without it, stdout is block-buffered in a pipe: every line of a
+          # 2 h build carried the step's end time, and the log could not show
+          # which part took the time (CVEScannerV3DB-nqf).
+          PYTHONUNBUFFERED: "1"
+          # Empty in a scheduled run. Through env, not inline: the input is
+          # text a person types.
+          ACCEPT_DROP: ${{ inputs.accept_drop }}
+        run: |
+          set -o pipefail
+          if [ -z "$NVD_KEY" ]; then
+            echo "::error::NVD_API_KEY secret is not set." >&2
+            exit 1
+          fi
+          # The last published database is only needed in this step.
+          trap 'rm -f cve.prev.db' EXIT
+          MODE="${{ steps.mode.outputs.mode }}"
+          FULL_ARGS=()
+          if [ "$MODE" = "full" ]; then FULL_ARGS=(--full); fi
+          CURATED="$GITHUB_WORKSPACE/scanner/extra/curated_dispositions.json"
+          CURATED_ARGS=()
+          if [ -f "$CURATED" ]; then CURATED_ARGS=(--curated "$CURATED"); fi
+          PREVIOUS_ARGS=()
+          if [ -f cve.prev.db ]; then PREVIOUS_ARGS=(--previous-db cve.prev.db); fi
+          # The build and the refresh of its stale parts take the same
+          # backport options: --refresh-stale refuses another config.
+          # --accept-drop lets these parts through the drop guard, which
+          # otherwise keeps a part stale whose CVEs in a release fall below
+          # half of what the last published database had (CVEScannerV3 #48).
+          ACCEPT_ARGS=()
+          if [ -n "$ACCEPT_DROP" ]; then ACCEPT_ARGS=(--accept-drop "$ACCEPT_DROP"); fi
+          BACKPORT_ARGS=(
+            --ecosystems "$BACKPORT_ECOSYSTEMS"
+            --redhat --redhat-packages "$REDHAT_PACKAGES" --redhat-releases "$REDHAT_RELEASES"
+            --ubuntu --ubuntu-packages "$UBUNTU_PACKAGES" --ubuntu-releases "$UBUNTU_RELEASES"
+            "${CURATED_ARGS[@]}" "${ACCEPT_ARGS[@]}"
+          )
+          stamp() { sqlite3 cve.db "SELECT COALESCE((SELECT value FROM build_info WHERE key = '$1'), '(not stamped)');" 2>/dev/null || echo "(unreadable)"; }
+          # -ns/--noscrape skips the exploit-db.com name scrape: it's WAF-rate-
+          # limited (~64s/batch, ~1h+ per run), fragile, and the scraped *names*
+          # are not needed for CVE matching. OSV/Red Hat/Ubuntu backports are
+          # always refreshed in full (cheap vs NVD).
+          #
+          # --refresh-raw fails the run when an NVD page fails twice, so the
+          # cache and the database built from it never miss a batch. FLOOR
+          # guards against a catastrophic partial that somehow got through.
+          # database.py skips deferred/rejected CVEs (~15% of the feed), so
+          # the cves table stays well below NVD's reported total.
+          #
+          # Retries: exit 1 (an NVD page that failed twice, an outage) builds
+          # again; the next build resumes the raw-cache refresh with the pages
+          # it has. Exit 3 (a stale backports part, see below) refetches only
+          # the stale parts (--refresh-stale), in minutes instead of a 1.5 h
+          # rebuild. Exit 2 (a configuration error) is not retried.
+          FLOOR=250000
+          max_builds=2
+          max_refreshes=2
+          # Start another attempt only when it can end in time. The job has
+          # timeout-minutes 360, and the other steps take a few minutes. A
+          # build takes up to ~2 h 15 min (2026-11-15: 95 and 112 min;
+          # 2026-11-17: 132 min, of which the Canonical step took 124 after
+          # 500/504 answers), and so can a refresh in which a Canonical
+          # package uses its whole resume budget. A run that stops here can
+          # still publish (see the end of this step); a run the timeout kills
+          # publishes nothing. The log has a time on each line
+          # (PYTHONUNBUFFERED), so a later run shows which part grew.
+          STEP_BUDGET=$((330 * 60))
+          ATTEMPT_MAX=$((135 * 60))
+          builds=0
+          refreshes=0
+          delay=120
+          next=build
+          while :; do
+            rc=0
+            if [ "$next" = build ]; then
+              builds=$((builds + 1))
+              echo "==> $MODE build (attempt $builds/$max_builds)"
+              python3 scanner/extra/database.py \
+                  -d cve.db \
+                  --raw-dir nvd-raw --refresh-raw --from-raw \
+                  "${FULL_ARGS[@]}" \
+                  -ns \
+                  --backports "${BACKPORT_ARGS[@]}" \
+                  "${PREVIOUS_ARGS[@]}" || rc=$?
+            else
+              refreshes=$((refreshes + 1))
+              echo "==> refresh of the stale backports parts (attempt $refreshes/$max_refreshes)"
+              python3 scanner/extra/database.py \
+                  -d cve.db \
+                  --refresh-stale "${BACKPORT_ARGS[@]}" || rc=$?
+            fi
+            if [ "$rc" -eq 0 ]; then
+              INGESTED=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;" 2>/dev/null || echo 0)
+              if [ "${INGESTED:-0}" -ge "$FLOOR" ]; then
+                echo "Complete after $builds build(s) and $refreshes refresh(es): $INGESTED CVEs; raw cache $(tr -d '\n' < nvd-raw/meta.json)"
+                exit 0
+              fi
+              echo "::warning::only $INGESTED CVEs (floor $FLOOR)"
+              next=build
+            elif [ "$rc" -eq 3 ]; then
+              # Exit 3: the backports are complete except for the stale parts
+              # (an OSV ecosystem, a Red Hat or Canonical package) that
+              # build_info.backports_stale names. A stale part keeps the rows
+              # of the last published database (--previous-db).
+              # backports_stale_empty names the stale parts that hold no rows
+              # all the same: no database was published before, or it was
+              # unreadable.
+              # A part is also stale when the drop guard stopped it; the log
+              # line "fewer than 50% of the CVEs" names it. A refresh tries it
+              # again, which helps when the source sent too little by mistake.
+              STALE=$(stamp backports_stale)
+              EMPTY=$(stamp backports_stale_empty)
+              echo "::warning::database.py exited 3: backports stale: $STALE; stale and holding no rows: ${EMPTY:-none}"
+              next=refresh
+            elif [ "$rc" -eq 2 ]; then
+              # Exit 2: a configuration error (an invalid ecosystem, an option
+              # that needs another one; CVEScannerV3 PR #38), or a command
+              # line that argparse or python3 rejects. It fails the same way
+              # on every run, so do not wait and retry. Exit 1 keeps the
+              # retry: it is also an NVD page that failed twice, and the next
+              # attempt resumes the refresh with the pages it has.
+              echo "::error::database.py exited 2: a configuration error (its last output line names it). A retry cannot fix it, so there is none." >&2
+              exit 1
+            else
+              echo "::warning::database.py failed (exit $rc)"
+              next=build
+            fi
+            if [ "$next" = build ] && [ "$builds" -ge "$max_builds" ]; then break; fi
+            if [ "$next" = refresh ] && [ "$refreshes" -ge "$max_refreshes" ]; then break; fi
+            if [ $((SECONDS + delay + ATTEMPT_MAX)) -gt "$STEP_BUDGET" ]; then
+              echo "::warning::no time for another $next: $((SECONDS / 60)) of $((STEP_BUDGET / 60)) min used, and an attempt can take $((ATTEMPT_MAX / 60))"
+              break
+            fi
+            echo "Retrying in ${delay}s"
+            sleep "$delay"
+            delay=$((delay * 2))
+          done
+          # Out of attempts with stale parts that all kept rows: publish. The
+          # database is new in every other part, and each stale part has the
+          # rows and backport_metadata date of the last published database,
+          # so it is never worse than that one. backports_stale stays in the
+          # stamp, so build-cve-db.sh refetches the backports after the
+          # download. "(not stamped)" (a database.py without
+          # backports_stale_empty) never counts as "all kept rows".
+          if [ "$rc" -eq 3 ]; then
+            INGESTED=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;" 2>/dev/null || echo 0)
+            if [ -n "$EMPTY" ]; then
+              echo "::error::stale backports parts hold no rows ($EMPTY); not publishing a database that lacks them." >&2
+            elif [ "${INGESTED:-0}" -lt "$FLOOR" ]; then
+              echo "::error::only $INGESTED CVEs (floor $FLOOR); not publishing." >&2
+            else
+              echo "::warning::publishing with stale backports parts ($STALE): they keep the rows of the last published database, and backports_stale names them. If the log says the drop guard stopped a part and the drop is real, run this workflow again with accept_drop."
+              exit 0
+            fi
+          fi
+          echo "::error::database update did not complete after $builds build(s) and $refreshes refresh(es)." >&2
+          exit 1
+
+      - name: Sanity-check the database
+        run: |
+          CVES=$(sqlite3 cve.db "SELECT COUNT(*) FROM cves;")
+          BP=$(sqlite3 cve.db "SELECT COUNT(*) FROM backports;")
+          echo "CVEs: $CVES, backports: $BP"
+          # A healthy DB has hundreds of thousands of CVEs; refuse to ship a
+          # truncated/empty DB that would clobber the good dumps in this repo.
+          [ "${CVES:-0}" -ge 100000 ] || { echo "::error::cve.db has only $CVES CVEs — refusing to publish." >&2; exit 1; }
+          [ "${BP:-0}" -ge 1 ]        || { echo "::error::backports table is empty — refusing to publish." >&2; exit 1; }
+
+      - name: Stamp the database
+        id: stamp
+        run: |
+          # db_id names this build. It goes into the database (so the dump
+          # parts carry it too) and into stamp.json, which build-cve-db.sh
+          # compares with its local copy before downloading anything.
+          DB_ID="${{ github.run_id }}-${{ github.run_attempt }}"
+          sqlite3 cve.db "INSERT OR REPLACE INTO build_info VALUES ('db_id', '$DB_ID'),
+            ('scanner_commit', '$(git -C scanner rev-parse HEAD)'),
+            ('nvd_last_mod', (SELECT last_mod FROM metadata));"
+          sqlite3 cve.db "VACUUM;"
+          python3 - "$DB_ID" <<'PY'
+          import hashlib, json, sqlite3, sys
+          info = dict(sqlite3.connect("cve.db").execute("SELECT key, value FROM build_info"))
+          digest = hashlib.sha256()
+          with open("cve.db", "rb") as f:
+              for chunk in iter(lambda: f.read(1 << 20), b""):
+                  digest.update(chunk)
+          info.update(db_id=sys.argv[1], sha256=digest.hexdigest())
+          with open("stamp.json", "w") as f:
+              json.dump(info, f, indent=1, sort_keys=True)
+          print(json.dumps(info, indent=1, sort_keys=True))
+          PY
+
+      - name: Regenerate dump parts
+        run: |
+          rm -f dump.p*
+          sqlite3 cve.db .dump > dump.sql
+          # 25 MiB parts, zero-padded numeric suffix -> dump.p00, dump.p01, ...
+          split -b 25M -d dump.sql dump.p
+          rm -f dump.sql
+
+      - name: Preserve the code on a branch that keeps history
+        # Backstop for anything unforeseen in the step below: recording history
+        # is secondary to shipping the database, and this runs before the
+        # commit that publishes it.
+        continue-on-error: true
+        run: |
+          # The orphan commit below exists to stop ~369 MB of dumps
+          # accumulating, and that part is right. But it takes the code with
+          # it: master ends up one commit deep, so there is no diff between
+          # database updates and a regression to this workflow leaves nothing
+          # to review. That is how the completeness gate from #5 was lost — a
+          # manual reconciliation on 2026-08-03 reverted it and the next
+          # scheduled run carried the revert forward unnoticed until #6.
+          #
+          # The non-dump files are 52 KB against that 369 MB, so keeping their
+          # real history costs nothing the orphan was protecting against.
+          #
+          # Built with plumbing on a temporary index: no checkout, so a 369 MB
+          # working tree is never rewritten just to record 52 KB. Runs BEFORE
+          # the orphan, while HEAD still has the code.
+          set -euo pipefail
+          # NUL-delimited throughout: a path with a space would otherwise be
+          # split by xargs into two nonexistent paths, and `git update-index`
+          # exits non-zero on those, taking the whole job down with it.
+          if [ -z "$(git ls-tree -r -z HEAD --name-only | grep -zv '^dump\.' | tr -d '\0')" ]; then
+            echo "::warning::no non-dump files found; skipping code-history"
+            exit 0
+          fi
+
+          GIT_INDEX_FILE=$(mktemp -u); export GIT_INDEX_FILE
+          git read-tree --empty
+          git ls-tree -r -z HEAD --name-only | grep -zv '^dump\.' \
+            | xargs -0 -r git update-index --add --
+          CODE_TREE=$(git write-tree)
+          rm -f "$GIT_INDEX_FILE"; unset GIT_INDEX_FILE
+
+          git fetch -q origin code-history 2>/dev/null || true
+          PARENT=$(git rev-parse --verify -q FETCH_HEAD 2>/dev/null || true)
+
+          # No empty commit when the code did not move: most updates change
+          # only the dumps, and 26 empty commits a year would bury the ones
+          # that matter.
+          if [ -n "$PARENT" ] && [ "$(git rev-parse "$PARENT^{tree}")" = "$CODE_TREE" ]; then
+            echo "code-history: unchanged since $(git rev-parse --short "$PARENT"), nothing to record"
+            exit 0
+          fi
+
+          MSG="Code as of the ${{ steps.mode.outputs.mode }} database update - $(date -u +%Y-%m-%d)
+
+          Snapshot of the non-dump files, taken before the orphan commit that
+          replaces master. master keeps no history by design; this branch is
+          where a change to the workflows, README or build.sh can be diffed."
+
+          if [ -n "$PARENT" ]; then
+            COMMIT=$(git commit-tree "$CODE_TREE" -p "$PARENT" -m "$MSG")
+          else
+            COMMIT=$(git commit-tree "$CODE_TREE" -m "$MSG")
+          fi
+          # Never fatal. This step runs before "Commit refreshed dumps", so
+          # aborting here would throw away a rebuild that costs 1-2h of NVD
+          # ingest — a disproportionate price for failing to record 52 KB.
+          # The warning is visible in the run summary.
+          if git push -q origin "$COMMIT:refs/heads/code-history"; then
+            echo "code-history: recorded $(git rev-parse --short "$COMMIT")"
+          else
+            echo "::warning::could not push code-history; the database update continues, but this update's code is unrecorded"
+          fi
+
+      - name: Publish the database and the raw cache as release assets
+        run: |
+          set -euo pipefail
+          zstd -q -T0 -12 cve.db -o cve.db.zst
+          tar -C nvd-raw -cf - meta.json cpes.txt cves.jsonl | zstd -q -T0 -12 -o nvd-raw.tar.zst
+          ls -la cve.db.zst nvd-raw.tar.zst
+          # The tags point at code-history (52 KB of code), not at a master
+          # commit, which would pin ~369 MB of dumps forever.
+          ensure_release() {
+            local notes="Replaced by every database update; see .github/workflows/update.yaml."
+            gh release view "$1" >/dev/null 2>&1 && return 0
+            gh release create "$1" --target code-history --title "$2" --notes "$notes" && return 0
+            echo "::warning::code-history missing; tagging $1 at ${{ github.sha }}"
+            gh release create "$1" --target "${{ github.sha }}" --title "$2" --notes "$notes"
+          }
+          ensure_release "$RAW_RELEASE" "NVD raw cache"
+          ensure_release "$DB_RELEASE" "cve.db"
+          gh release upload "$RAW_RELEASE" nvd-raw.tar.zst --clobber
+          # stamp.json last: a reader that sees the new stamp finds the new
+          # database already uploaded (and checks its sha256 either way).
+          gh release upload "$DB_RELEASE" cve.db.zst --clobber
+          gh release upload "$DB_RELEASE" stamp.json --clobber
+
+      - name: Commit refreshed dumps
+        run: |
+          # cve.db, the raw cache and the release files are gitignored; only
+          # the dump.p* parts are tracked.
+          # Orphan-commit keeps the repo small despite ~369 MB of binary dumps.
+          # The code's history is preserved on code-history by the step above,
+          # so this discards only the dump snapshots it is meant to.
+          set -euo pipefail
+          git checkout --orphan latest
+          git add -A
+          # Last look before the force-push: "add -A" stages anything the run
+          # left untracked and not ignored (the scanner/ gitlink at 330acf7
+          # came in this way), which would then reach master without ever
+          # reaching code-history. The database is already published as a
+          # release asset, so stopping here costs only this dump refresh.
+          if git fetch -q --no-tags --depth=1 origin +refs/heads/code-history:refs/remotes/origin/code-history; then
+            .github/scripts/code-history.sh check --cached
+          else
+            echo "::warning::code-history not fetchable; committing without the drift check"
+          fi
+          git commit -m "Update CVE database (${{ steps.mode.outputs.mode }} + backports) - $(date -u +%Y-%m-%d)"
+          git branch -D master
+          git branch -m master
+          git push -f origin master
