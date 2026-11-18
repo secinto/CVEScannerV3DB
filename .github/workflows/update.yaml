@@ -30,6 +30,10 @@ on:
         type: choice
         default: incremental
         options: [incremental, full]
+      accept_drop:
+        description: "Backport parts that may lose more than half of their CVEs in a release, as backports_stale names them (osv:Debian:11,ubuntu-security:openssl). Only for a drop you checked: the drop guard keeps a part stale otherwise"
+        type: string
+        default: ""
   schedule:
     # 03:00 UTC on the 1st and 15th. The 1st-of-month run is forced to full
     # (see the 'Decide mode' step); the 15th is incremental.
@@ -192,6 +196,13 @@ jobs:
         env:
           # database.py reads the NVD key from the NVD_KEY env var.
           NVD_KEY: ${{ secrets.NVD_API_KEY }}
+          # Without it, stdout is block-buffered in a pipe: every line of a
+          # 2 h build carried the step's end time, and the log could not show
+          # which part took the time (CVEScannerV3DB-nqf).
+          PYTHONUNBUFFERED: "1"
+          # Empty in a scheduled run. Through env, not inline: the input is
+          # text a person types.
+          ACCEPT_DROP: ${{ inputs.accept_drop }}
         run: |
           set -o pipefail
           if [ -z "$NVD_KEY" ]; then
@@ -210,11 +221,16 @@ jobs:
           if [ -f cve.prev.db ]; then PREVIOUS_ARGS=(--previous-db cve.prev.db); fi
           # The build and the refresh of its stale parts take the same
           # backport options: --refresh-stale refuses another config.
+          # --accept-drop lets these parts through the drop guard, which
+          # otherwise keeps a part stale whose CVEs in a release fall below
+          # half of what the last published database had (CVEScannerV3 #48).
+          ACCEPT_ARGS=()
+          if [ -n "$ACCEPT_DROP" ]; then ACCEPT_ARGS=(--accept-drop "$ACCEPT_DROP"); fi
           BACKPORT_ARGS=(
             --ecosystems "$BACKPORT_ECOSYSTEMS"
             --redhat --redhat-packages "$REDHAT_PACKAGES" --redhat-releases "$REDHAT_RELEASES"
             --ubuntu --ubuntu-packages "$UBUNTU_PACKAGES" --ubuntu-releases "$UBUNTU_RELEASES"
-            "${CURATED_ARGS[@]}"
+            "${CURATED_ARGS[@]}" "${ACCEPT_ARGS[@]}"
           )
           stamp() { sqlite3 cve.db "SELECT COALESCE((SELECT value FROM build_info WHERE key = '$1'), '(not stamped)');" 2>/dev/null || echo "(unreadable)"; }
           # -ns/--noscrape skips the exploit-db.com name scrape: it's WAF-rate-
@@ -238,12 +254,15 @@ jobs:
           max_refreshes=2
           # Start another attempt only when it can end in time. The job has
           # timeout-minutes 360, and the other steps take a few minutes. A
-          # build takes up to ~2 h (2026-11-15: 95 and 112 min), and so can a
-          # refresh in which a Canonical package uses its whole resume
-          # budget. A run that stops here can still publish (see the end of
-          # this step); a run the timeout kills publishes nothing.
+          # build takes up to ~2 h 15 min (2026-11-15: 95 and 112 min;
+          # 2026-11-17: 132 min, of which the Canonical step took 124 after
+          # 500/504 answers), and so can a refresh in which a Canonical
+          # package uses its whole resume budget. A run that stops here can
+          # still publish (see the end of this step); a run the timeout kills
+          # publishes nothing. The log has a time on each line
+          # (PYTHONUNBUFFERED), so a later run shows which part grew.
           STEP_BUDGET=$((330 * 60))
-          ATTEMPT_MAX=$((120 * 60))
+          ATTEMPT_MAX=$((135 * 60))
           builds=0
           refreshes=0
           delay=120
@@ -283,6 +302,9 @@ jobs:
               # backports_stale_empty names the stale parts that hold no rows
               # all the same: no database was published before, or it was
               # unreadable.
+              # A part is also stale when the drop guard stopped it; the log
+              # line "fewer than 50% of the CVEs" names it. A refresh tries it
+              # again, which helps when the source sent too little by mistake.
               STALE=$(stamp backports_stale)
               EMPTY=$(stamp backports_stale_empty)
               echo "::warning::database.py exited 3: backports stale: $STALE; stale and holding no rows: ${EMPTY:-none}"
@@ -324,7 +346,7 @@ jobs:
             elif [ "${INGESTED:-0}" -lt "$FLOOR" ]; then
               echo "::error::only $INGESTED CVEs (floor $FLOOR); not publishing." >&2
             else
-              echo "::warning::publishing with stale backports parts ($STALE): they keep the rows of the last published database, and backports_stale names them."
+              echo "::warning::publishing with stale backports parts ($STALE): they keep the rows of the last published database, and backports_stale names them. If the log says the drop guard stopped a part and the drop is real, run this workflow again with accept_drop."
               exit 0
             fi
           fi
